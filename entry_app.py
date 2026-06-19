@@ -9,6 +9,7 @@ from datetime import datetime
 import os
 import glob
 import json
+import sqlite3
 
 # ─────────────────────────────────────────────
 #  CONFIGURATION — edit these paths as needed
@@ -22,6 +23,7 @@ RADAR_OUT_DIR   = os.path.join(BASE_DIR, 'radar')
 LIDAR_OUT_DIR   = os.path.join(BASE_DIR, 'lidar')
 
 SESSION_FILE    = os.path.join(BASE_DIR, 'session_units.json')
+HISTORY_DB_FILE = os.path.join(BASE_DIR, 'history_index.sqlite3')
 SEAL_IMAGE      = os.path.join(BASE_DIR, 'seal.png')
 SEALED_DIR      = os.path.join(BASE_DIR, 'sealed')
 
@@ -120,82 +122,241 @@ _HISTORY_INDEX = {'RADAR': {}, 'LIDAR': {}}
 _INDEX_READY   = False
 _INDEX_STATUS  = "Not built"
 
+def _history_workbooks():
+    pattern = os.path.join(HISTORY_DIR, 'week_report_*.xlsx')
+    history_files = sorted(glob.glob(pattern), reverse=True)
+    return history_files + [EXCEL_2026]
+
+def _file_stamp(filepath):
+    st = os.stat(filepath)
+    return st.st_mtime_ns, st.st_size
+
+def _history_db_connect():
+    os.makedirs(BASE_DIR, exist_ok=True)
+    conn = sqlite3.connect(HISTORY_DB_FILE, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS files (
+            path TEXT PRIMARY KEY,
+            mtime_ns INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            file_order INTEGER NOT NULL,
+            indexed_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path TEXT NOT NULL,
+            source_file TEXT NOT NULL,
+            file_order INTEGER NOT NULL,
+            row_order INTEGER NOT NULL,
+            sheet_name TEXT NOT NULL,
+            unit_serial TEXT NOT NULL,
+            lab_number TEXT,
+            chps_number TEXT,
+            address_code TEXT,
+            cert_date TEXT,
+            shipped_date TEXT,
+            antenna1_number TEXT,
+            antenna2_number TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_records_sheet_serial ON records(sheet_name, unit_serial)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_records_source ON records(source_path)")
+    conn.commit()
+    return conn
+
+def _clean_history_row(row_tuple, sheet_name, source_file, source_path, file_order, row_order):
+    if not row_tuple or len(row_tuple) < 5:
+        return None
+    cell_b = row_tuple[1]
+    if not cell_b:
+        return None
+
+    is_radar = (sheet_name == 'RADAR')
+    chps_val = row_tuple[2]
+    ant1_val = row_tuple[11] if is_radar and len(row_tuple) > 11 else None
+    ant2_val = row_tuple[12] if is_radar and len(row_tuple) > 12 else None
+    chps_clean = str(chps_val).replace('CHPS', '') if chps_val else ''
+    ant1_clean = ant1_val.replace('S/N ', '') if isinstance(ant1_val, str) and ant1_val != 'N/A' else None
+    ant2_clean = ant2_val.replace('S/N ', '') if isinstance(ant2_val, str) and ant2_val != 'N/A' else None
+    ship_val = row_tuple[5] if len(row_tuple) > 5 else None
+
+    return {
+        'source_path':     source_path,
+        'source_file':     source_file,
+        'file_order':      file_order,
+        'row_order':       row_order,
+        'sheet_name':      sheet_name,
+        'lab_number':      row_tuple[0],
+        'unit_serial':     str(cell_b).strip(),
+        'chps_number':     chps_clean,
+        'address_code':    row_tuple[3],
+        'date':            row_tuple[4],
+        'shipped_date':    ship_val,
+        'antenna1_number': ant1_clean,
+        'antenna2_number': ant2_clean,
+    }
+
+def _db_row_to_record(row):
+    return {
+        'lab_number':      row['lab_number'],
+        'unit_serial':     row['unit_serial'],
+        'chps_number':     row['chps_number'] or '',
+        'address_code':    row['address_code'],
+        'date':            row['cert_date'],
+        'shipped_date':    row['shipped_date'],
+        'antenna1_number': row['antenna1_number'],
+        'antenna2_number': row['antenna2_number'],
+        'source_file':     row['source_file'],
+    }
+
+def _insert_history_record(conn, record):
+    conn.execute("""
+        INSERT INTO records (
+            source_path, source_file, file_order, row_order, sheet_name,
+            unit_serial, lab_number, chps_number, address_code, cert_date,
+            shipped_date, antenna1_number, antenna2_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        str(record['source_path']),
+        str(record['source_file']),
+        int(record['file_order']),
+        int(record['row_order']),
+        str(record['sheet_name']),
+        str(record['unit_serial']),
+        str(record['lab_number']) if record['lab_number'] is not None else None,
+        str(record['chps_number']) if record['chps_number'] is not None else None,
+        str(record['address_code']) if record['address_code'] is not None else None,
+        str(record['date']) if record['date'] is not None else None,
+        str(record['shipped_date']) if record['shipped_date'] is not None else None,
+        str(record['antenna1_number']) if record['antenna1_number'] is not None else None,
+        str(record['antenna2_number']) if record['antenna2_number'] is not None else None,
+    ))
+
+def _index_workbook_to_db(conn, filepath, file_order):
+    fname = os.path.basename(filepath)
+    mtime_ns, size = _file_stamp(filepath)
+
+    conn.execute("DELETE FROM records WHERE source_path = ?", (filepath,))
+    wb = load_workbook(filepath, read_only=True, data_only=True)
+    try:
+        for sheet_name in ('RADAR', 'LIDAR'):
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            for row_order, row_tuple in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+                record = _clean_history_row(row_tuple, sheet_name, fname, filepath, file_order, row_order)
+                if record:
+                    _insert_history_record(conn, record)
+    finally:
+        wb.close()
+
+    conn.execute("""
+        INSERT OR REPLACE INTO files (path, mtime_ns, size, file_order, indexed_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (filepath, mtime_ns, size, file_order, datetime.now().isoformat(timespec='seconds')))
+
+def _load_history_index_from_db(conn):
+    conn.row_factory = sqlite3.Row
+    index = {'RADAR': {}, 'LIDAR': {}}
+    for row in conn.execute("""
+        SELECT * FROM records
+        ORDER BY file_order ASC, row_order ASC
+    """):
+        record = _db_row_to_record(row)
+        index[row['sheet_name']][row['unit_serial']] = record
+    return index
+
+def _search_history_db(serial_number, sheet_name, all_matches=False):
+    try:
+        conn = _history_db_connect()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT * FROM records
+            WHERE sheet_name = ? AND unit_serial LIKE ?
+            ORDER BY file_order DESC, row_order DESC
+        """, (sheet_name, f"%{serial_number}")).fetchall()
+        conn.close()
+        records = [_db_row_to_record(row) for row in rows]
+        return records if all_matches else (records[0] if records else None)
+    except Exception:
+        return [] if all_matches else None
+
 def _build_history_index(on_progress=None):
     """
-    Scan ALL history files + current year Excel and build an in-memory index.
-    Uses iter_rows() for fast bulk row reading instead of cell-by-cell access.
+    Build the in-memory index from a persistent SQLite cache.
+    Excel files are only re-read when their mtime/size changes.
     """
     global _HISTORY_INDEX, _INDEX_READY, _INDEX_STATUS
 
     _INDEX_READY  = False
-    _INDEX_STATUS = "Building index..."
+    _INDEX_STATUS = "Checking index cache..."
 
-    index = {'RADAR': {}, 'LIDAR': {}}
+    try:
+        conn = _history_db_connect()
+        all_files = [p for p in _history_workbooks() if os.path.exists(p)]
+        total = len(all_files)
+        current_paths = set(all_files)
 
-    pattern       = os.path.join(HISTORY_DIR, 'week_report_*.xlsx')
-    history_files = sorted(glob.glob(pattern), reverse=True)
-    all_files     = history_files + [EXCEL_2026]
+        # Drop records for files that no longer exist.
+        for (cached_path,) in conn.execute("SELECT path FROM files").fetchall():
+            if cached_path not in current_paths:
+                conn.execute("DELETE FROM records WHERE source_path = ?", (cached_path,))
+                conn.execute("DELETE FROM files WHERE path = ?", (cached_path,))
 
-    total = len(all_files)
-    for i, filepath in enumerate(all_files):
-        fname       = os.path.basename(filepath)
-        is_current  = (filepath == EXCEL_2026)
+        for i, filepath in enumerate(all_files):
+            fname = os.path.basename(filepath)
+            file_order = i
+            try:
+                mtime_ns, size = _file_stamp(filepath)
+                cached = conn.execute(
+                    "SELECT mtime_ns, size, file_order FROM files WHERE path = ?",
+                    (filepath,)
+                ).fetchone()
+                needs_index = (
+                    cached is None or
+                    cached[0] != mtime_ns or
+                    cached[1] != size or
+                    cached[2] != file_order
+                )
+                if needs_index:
+                    if on_progress:
+                        on_progress(f"Indexing {i+1}/{total}: {fname}")
+                    _index_workbook_to_db(conn, filepath, file_order)
+                    conn.commit()
+                else:
+                    if on_progress:
+                        on_progress(f"Using cache {i+1}/{total}: {fname}")
+            except Exception as e:
+                if on_progress:
+                    on_progress(f"Skipped {fname}: {e}")
+                continue
+
+        index = _load_history_index_from_db(conn)
+        conn.close()
+
+        _HISTORY_INDEX = index
+        _INDEX_READY   = True
+        radar_count = len(index['RADAR'])
+        lidar_count = len(index['LIDAR'])
+        _INDEX_STATUS  = f"Index ready — {radar_count} RADAR, {lidar_count} LIDAR records"
         if on_progress:
-            on_progress(f"Indexing {i+1}/{total}: {fname}")
-        try:
-            wb = load_workbook(filepath, read_only=True, data_only=True)
-            for sheet_name in ('RADAR', 'LIDAR'):
-                if sheet_name not in wb.sheetnames:
-                    continue
-                ws = wb[sheet_name]
-                is_radar = (sheet_name == 'RADAR')
-                for row_tuple in ws.iter_rows(min_row=2, values_only=True):
-                    if not row_tuple or len(row_tuple) < 5:
-                        continue
-                    cell_b = row_tuple[1]
-                    if not cell_b:
-                        continue
-                    key = str(cell_b).strip()
-                    if not is_current and key in index[sheet_name]:
-                        continue
-                    lab_val  = row_tuple[0]
-                    chps_val = row_tuple[2]
-                    addr_val = row_tuple[3]
-                    date_val = row_tuple[4]
-                    ant1_val = row_tuple[11] if is_radar and len(row_tuple) > 11 else None
-                    ant2_val = row_tuple[12] if is_radar and len(row_tuple) > 12 else None
-                    chps_clean = str(chps_val).replace('CHPS', '') if chps_val else ''
-                    ant1_clean = ant1_val.replace('S/N ', '') if isinstance(ant1_val, str) and ant1_val != 'N/A' else None
-                    ant2_clean = ant2_val.replace('S/N ', '') if isinstance(ant2_val, str) and ant2_val != 'N/A' else None
-                    ship_val = row_tuple[5] if len(row_tuple) > 5 else None
-                    index[sheet_name][key] = {
-                        'lab_number':      lab_val,
-                        'unit_serial':     key,
-                        'chps_number':     chps_clean,
-                        'address_code':    addr_val,
-                        'date':            date_val,
-                        'shipped_date':    ship_val,
-                        'antenna1_number': ant1_clean,
-                        'antenna2_number': ant2_clean,
-                        'source_file':     fname,
-                    }
-            wb.close()
-        except Exception:
-            continue
-
-    _HISTORY_INDEX = index
-    _INDEX_READY   = True
-    radar_count = len(index['RADAR'])
-    lidar_count = len(index['LIDAR'])
-    _INDEX_STATUS  = f"Index ready — {radar_count} RADAR, {lidar_count} LIDAR records"
-    if on_progress:
-        on_progress(_INDEX_STATUS)
+            on_progress(_INDEX_STATUS)
+    except Exception as e:
+        _HISTORY_INDEX = {'RADAR': {}, 'LIDAR': {}}
+        _INDEX_READY   = False
+        _INDEX_STATUS  = f"Index cache unavailable: {e}"
+        if on_progress:
+            on_progress(_INDEX_STATUS)
 
 
 def search_all_history(serial_number, sheet_name):
     """
     Search the in-memory index for the most recent entry matching serial_number.
-    Falls back to file scan if index not ready yet.
+    Falls back to SQLite cache, then file scan if index not ready yet.
     """
     if _INDEX_READY:
         sheet_index = _HISTORY_INDEX.get(sheet_name, {})
@@ -204,10 +365,12 @@ def search_all_history(serial_number, sheet_name):
                 return record
         return None
 
+    cached_record = _search_history_db(serial_number, sheet_name, all_matches=False)
+    if cached_record:
+        return cached_record
+
     # Fallback: original file scan
-    pattern = os.path.join(HISTORY_DIR, 'week_report_*.xlsx')
-    files = sorted(glob.glob(pattern), reverse=True)
-    all_files = files + [EXCEL_2026]
+    all_files = _history_workbooks()
 
     for filepath in all_files:
         try:
@@ -255,9 +418,12 @@ def search_all_entries_for_serial(serial_number, sheet_name):
     Used by the Search Tab to show complete history.
     """
     results = []
-    pattern = os.path.join(HISTORY_DIR, 'week_report_*.xlsx')
-    files = sorted(glob.glob(pattern), reverse=True)
-    all_files = [EXCEL_2026] + files   # current year first (newest)
+
+    cached_results = _search_history_db(serial_number, sheet_name, all_matches=True)
+    if cached_results:
+        return cached_results
+
+    all_files = [EXCEL_2026] + sorted(glob.glob(os.path.join(HISTORY_DIR, 'week_report_*.xlsx')), reverse=True)
 
     for filepath in all_files:
         fname = os.path.basename(filepath)
@@ -304,7 +470,7 @@ def years_since(date_val):
     if not date_val:
         return None
     if isinstance(date_val, str):
-        for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
+        for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%y"):
             try:
                 date_val = datetime.strptime(date_val, fmt)
                 break
