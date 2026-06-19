@@ -395,6 +395,64 @@ def expand_log_number_entries(raw):
             unique_entries.append(entry)
     return unique_entries, errors
 
+def normalize_scanned_value(value, field_label="", expected_length=None, any_length=False):
+    """
+    Normalize common keyboard-wedge barcode scans before verification.
+    Handles prefixes such as CHPS, S/N, SN, serial labels, and unit type prefixes.
+    """
+    import re
+
+    raw = str(value or '').strip()
+    if not raw:
+        return ''
+
+    # Scanners often append Enter/Tab and sometimes wrap data in whitespace.
+    raw = raw.replace('\r', '').replace('\n', '').replace('\t', '').strip()
+    label = (field_label or '').upper()
+    upper_raw = raw.upper()
+
+    if 'CHPS' in label:
+        m = re.search(r'CHPS\s*[-:#]?\s*(\d+)', upper_raw)
+        if m:
+            return m.group(1)[-expected_length:] if expected_length else m.group(1)
+        digits = ''.join(re.findall(r'\d+', raw))
+        if expected_length and len(digits) >= expected_length:
+            return digits[-expected_length:]
+        return digits or raw
+
+    if any(token in label for token in ('SERIAL', 'ANTENNA', 'FA NUMBER', 'FB NUMBER')):
+        cleaned = re.sub(r'(?i)\b(SERIAL|SERIAL\s*NUMBER|S/N|SN|SNO|NO|NUMBER)\b', '', raw)
+        cleaned = cleaned.strip(' :-#')
+        for unit_prefix in sorted(RADAR_TYPES + LIDAR_TYPES, key=len, reverse=True):
+            if cleaned.upper().startswith(unit_prefix) and len(cleaned) > len(unit_prefix):
+                cleaned = cleaned[len(unit_prefix):].strip(' :-#')
+                break
+        if any_length:
+            return cleaned or raw
+        digits = ''.join(re.findall(r'\d+', cleaned))
+        if expected_length and not any_length and len(digits) >= expected_length:
+            return digits[-expected_length:]
+        if digits:
+            return digits
+        return cleaned or raw
+
+    return raw
+
+def normalize_address_code(value):
+    """Accept scans like 'CHP (530)' or 'Address: 530' and return the code."""
+    import re
+
+    raw = str(value or '').strip()
+    if not raw:
+        return ''
+    m = re.search(r'CHP\s*\(([^)]+)\)', raw, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    digits = ''.join(re.findall(r'\d+', raw))
+    if digits:
+        return digits[-3:] if len(digits) > 3 else digits
+    return raw
+
 
 # ─────────────────────────────────────────────
 #  VERIFY DIALOG
@@ -1108,6 +1166,8 @@ class VerifiedField(tk.Frame):
         self.entry_display.pack(ipady=5)
 
         self.entry_display.bind("<Return>", lambda e: self._open_verify())
+        self.entry_display.bind("<KP_Enter>", lambda e: self._open_verify())
+        self.entry_display.bind("<Tab>", self._on_scan_tab)
         self.entry_display.bind("<FocusOut>", self._on_focus_out)
 
         self.verify_btn = tk.Button(
@@ -1127,19 +1187,43 @@ class VerifiedField(tk.Frame):
 
     def _on_focus_out(self, event=None):
         if not self._locked and self.display_var.get().strip():
+            self._normalize_current_value()
             self.border_frame.config(bg=AMBER)
             self.status_lbl.config(text="◐ press VERIFY", fg=AMBER)
 
+    def _on_scan_tab(self, event=None):
+        if not self._locked and self.display_var.get().strip():
+            self._open_verify()
+            return "break"
+        return None
+
+    def _normalize_current_value(self):
+        current_val = self.display_var.get().strip()
+        normalized = normalize_scanned_value(
+            current_val,
+            field_label=self.label_text,
+            expected_length=self.length,
+            any_length=self.any_length
+        )
+        if normalized and normalized != current_val:
+            self.display_var.set(normalized)
+        return normalized or current_val
+
     def _set_prefill(self, value):
         self._prefill = value
-        self.display_var.set(value)
+        self.display_var.set(normalize_scanned_value(
+            value,
+            field_label=self.label_text,
+            expected_length=self.length,
+            any_length=self.any_length
+        ))
         self.border_frame.config(bg=AMBER)
         self.status_lbl.config(text="◐ pre-filled — verify", fg=AMBER)
 
     def _open_verify(self):
         if self._locked:
             return
-        current_val = self.display_var.get().strip()
+        current_val = self._normalize_current_value()
         if not current_val:
             self.border_frame.config(bg=RED)
             self.entry_display.focus_set()
@@ -1664,6 +1748,8 @@ class RadarForm(tk.Frame):
         self.addr_entry.pack(ipady=5)
         self.addr_entry.bind('<FocusOut>', self._lookup_address)
         self.addr_entry.bind('<Return>',   self._addr_enter)
+        self.addr_entry.bind('<KP_Enter>', self._addr_enter)
+        self.addr_entry.bind('<Tab>',      self._addr_enter)
 
         self.addr_display = tk.Label(self, text="", bg=BG, fg=GREEN,
                                      font=("Courier New", 9), justify='left')
@@ -1907,9 +1993,13 @@ class RadarForm(tk.Frame):
                 self.after(50, lambda: target.entry_display.focus_set())
             elif target == self.fork_toggle_btn or hasattr(target, 'focus_set'):
                 self.after(50, target.focus_set)
+        if event and getattr(event, 'keysym', '') == 'Tab':
+            return "break"
 
     def _lookup_address(self, event=None):
-        code = self.addr_var.get().strip()
+        code = normalize_address_code(self.addr_var.get())
+        if code != self.addr_var.get().strip():
+            self.addr_var.set(code)
         if not code:
             return
         key = f'CHP ({code})'
@@ -2197,6 +2287,8 @@ class LidarForm(tk.Frame):
         self.addr_entry.pack(ipady=5)
         self.addr_entry.bind('<FocusOut>', self._lookup_address)
         self.addr_entry.bind('<Return>',   self._addr_enter)
+        self.addr_entry.bind('<KP_Enter>', self._addr_enter)
+        self.addr_entry.bind('<Tab>',      self._addr_enter)
 
         self.addr_display = tk.Label(self, text="", bg=BG, fg=GREEN,
                                      font=("Courier New", 9), justify='left')
@@ -2317,9 +2409,13 @@ class LidarForm(tk.Frame):
         self._lookup_address()
         if self._address_1:
             self.after(50, lambda: self.submit_btn.focus_set())
+        if event and getattr(event, 'keysym', '') == 'Tab':
+            return "break"
 
     def _lookup_address(self, event=None):
-        code = self.addr_var.get().strip()
+        code = normalize_address_code(self.addr_var.get())
+        if code != self.addr_var.get().strip():
+            self.addr_var.set(code)
         if not code:
             return
         key = f'CHP ({code})'
