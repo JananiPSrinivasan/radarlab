@@ -68,6 +68,9 @@ LIDAR_UNIT_NAMES = {
 DEFAULT_FA = "326655"
 DEFAULT_FB = "438384"
 
+RETEST_PROMPT_YEARS = 2.5
+RETEST_MIN_YEARS = 3.0
+
 # ─────────────────────────────────────────────
 #  COLORS & STYLES
 # ─────────────────────────────────────────────
@@ -325,13 +328,80 @@ def digits_match_transposed(a, b):
             return True
     return False
 
+def parse_lab_number(value, prefix):
+    """Return the numeric lab number from a full lab value or bare number."""
+    raw = str(value or '').replace(' (RETEST)', '').strip()
+    if not raw:
+        return None
+    upper_raw = raw.upper()
+    upper_prefix = prefix.upper()
+    if upper_raw.startswith(upper_prefix):
+        raw = raw[len(prefix):].strip()
+    if raw.isdigit():
+        return int(raw)
+    return None
+
+def format_lab_number(prefix, number):
+    return f"{prefix}{int(number)}"
+
+def expand_log_number_entries(raw):
+    """
+    Expand comma/newline separated lab numbers plus ranges.
+    Supported range examples: AS26-72 to AS26-80, AS26-72-AS26-80, ASL26-45:48.
+    """
+    import re
+
+    entries = []
+    errors = []
+    chunks = [x.strip() for x in re.split(r'[,\n]+', raw or '') if x.strip()]
+    single_re = re.compile(r'^(ASL26-|AS26-)(\d+)$', re.IGNORECASE)
+    range_re = re.compile(
+        r'^(ASL26-|AS26-)(\d+)\s*(?:TO|:|-)\s*(?:(ASL26-|AS26-)?)(\d+)$',
+        re.IGNORECASE
+    )
+
+    for chunk in chunks:
+        normalized = chunk.strip().upper()
+        single = single_re.match(normalized.replace(' ', ''))
+        if single:
+            prefix, number = single.groups()
+            entries.append(format_lab_number(prefix, number))
+            continue
+
+        match = range_re.match(normalized)
+        if match:
+            start_prefix, start_num, end_prefix, end_num = match.groups()
+            end_prefix = end_prefix or start_prefix
+            if start_prefix.upper() != end_prefix.upper():
+                errors.append(f"{chunk}: range prefixes must match")
+                continue
+            start = int(start_num)
+            end = int(end_num)
+            if end < start:
+                errors.append(f"{chunk}: range end is before start")
+                continue
+            for number in range(start, end + 1):
+                entries.append(format_lab_number(start_prefix.upper(), number))
+            continue
+
+        errors.append(f"{chunk}: expected AS26-### or ASL26-###")
+
+    unique_entries = []
+    seen = set()
+    for entry in entries:
+        key = entry.upper()
+        if key not in seen:
+            seen.add(key)
+            unique_entries.append(entry)
+    return unique_entries, errors
+
 
 # ─────────────────────────────────────────────
 #  VERIFY DIALOG
 # ─────────────────────────────────────────────
 class VerifyDialog(tk.Toplevel):
     """
-    Double-entry + digit readback dialog.
+    Single-entry + digit readback dialog.
     Returns confirmed value via self.result (None if cancelled).
     """
     def __init__(self, parent, field_label, prefill="", length=6, any_length=False):
@@ -349,7 +419,11 @@ class VerifyDialog(tk.Toplevel):
 
         self._phase = "entry"
         self._prefill = prefill
-        self._build_entry_phase()
+        if self._prefill:
+            if not self._check_single_value(self._prefill):
+                self._build_entry_phase(self._prefill)
+        else:
+            self._build_entry_phase()
 
         self.update_idletasks()
         px = parent.winfo_rootx() + (parent.winfo_width()  - self.winfo_width())  // 2
@@ -360,27 +434,20 @@ class VerifyDialog(tk.Toplevel):
         for w in self.winfo_children():
             w.destroy()
 
-    def _build_entry_phase(self):
+    def _build_entry_phase(self, initial_value=""):
         self._clear_frame()
         tk.Label(self, text=f"VERIFY: {self.field_label}",
                  bg=WHITE, fg=ACCENT,
                  font=("Courier New", 12, "bold")).pack(padx=20, pady=(20,4))
 
-        tk.Label(self, text="Enter value:", bg=WHITE, fg=TEXT,
+        tk.Label(self, text="Enter value once:", bg=WHITE, fg=TEXT,
                  font=("Courier New", 10)).pack(anchor='w', padx=20)
         self.entry1 = tk.Entry(self, bg=PANEL_BG, fg=TEXT, insertbackground=TEXT,
                                font=("Courier New", 16, "bold"),
                                width=18, relief='solid', bd=1)
         self.entry1.pack(padx=20, pady=4, ipady=6)
-        if self._prefill:
-            self.entry1.insert(0, self._prefill)
-
-        tk.Label(self, text="Re-enter to confirm:", bg=WHITE, fg=TEXT,
-                 font=("Courier New", 10)).pack(anchor='w', padx=20)
-        self.entry2 = tk.Entry(self, bg=PANEL_BG, fg=TEXT, insertbackground=TEXT,
-                               font=("Courier New", 16, "bold"),
-                               width=18, relief='solid', bd=1)
-        self.entry2.pack(padx=20, pady=4, ipady=6)
+        if initial_value:
+            self.entry1.insert(0, initial_value)
 
         self.msg_var = tk.StringVar()
         tk.Label(self, textvariable=self.msg_var, bg=WHITE, fg=RED,
@@ -397,37 +464,27 @@ class VerifyDialog(tk.Toplevel):
                   padx=16, pady=6, cursor='hand2',
                   command=self.destroy).pack(side='left', padx=6)
 
-        self.entry1.bind("<Return>", lambda e: self.entry2.focus_set())
-        self.entry2.bind("<Return>", lambda e: self._check_match())
-        if not self._prefill:
-            self.entry1.focus_set()
-        else:
-            self.entry2.focus_set()
+        self.entry1.bind("<Return>", lambda e: self._check_match())
+        self.entry1.focus_set()
 
     def _check_match(self):
         v1 = self.entry1.get().strip()
-        v2 = self.entry2.get().strip()
+        self._check_single_value(v1)
 
-        if not v1 or not v2:
-            self.msg_var.set("⚠  Both fields required.")
-            return
+    def _check_single_value(self, value):
+        if not value:
+            if hasattr(self, 'msg_var'):
+                self.msg_var.set("⚠  Value required.")
+            return False
 
-        if not self.any_length and len(v1) != self.required_length:
-            self.msg_var.set(f"⚠  Must be {self.required_length} characters (got {len(v1)}).")
-            return
+        if not self.any_length and len(value) != self.required_length:
+            if hasattr(self, 'msg_var'):
+                self.msg_var.set(f"⚠  Must be {self.required_length} characters (got {len(value)}).")
+            return False
 
-        if v1 != v2:
-            if digits_match_transposed(v1, v2):
-                self.msg_var.set("⚠  Digits look TRANSPOSED — check carefully!")
-            else:
-                self.msg_var.set("⚠  Values do not match — try again.")
-            self.entry1.delete(0, 'end')
-            self.entry2.delete(0, 'end')
-            self.entry1.focus_set()
-            return
-
-        self._confirmed_value = v1
-        self._build_readback_phase(v1)
+        self._confirmed_value = value
+        self._build_readback_phase(value)
+        return True
 
     def _build_readback_phase(self, value):
         self._clear_frame()
@@ -1193,9 +1250,14 @@ class HistoryPanel(tk.Frame):
                 f"File:  {history['source_file']}")
         self.content.config(text=text, fg=TEXT)
 
-        if yrs is not None and yrs < 3.0:
+        if yrs is not None and yrs < RETEST_PROMPT_YEARS:
             self.warn_lbl.config(
-                text=f"⚠ WARNING\nOnly {yrs:.1f} yrs since\nlast test!\n(Min: 3 years)")
+                text=f"⚠ WARNING\nOnly {yrs:.1f} yrs since\nlast test!\n(Min: 3 years)",
+                fg=RED)
+        elif yrs is not None and yrs < RETEST_MIN_YEARS:
+            self.warn_lbl.config(
+                text=f"✓ No retest prompt\n({yrs:.1f} yrs since last test)",
+                fg=GREEN)
         else:
             self.warn_lbl.config(text="✓ Interval OK", fg=GREEN)
 
@@ -1265,11 +1327,21 @@ class EntryApp(tk.Tk):
 
         self.current_date = datetime.now().strftime("%m/%d/%Y")
         self.session_units = load_session()
+        self.next_lab_numbers = {'RADAR': None, 'LIDAR': None}
         self._build_ui()
         if self.session_units:
             self.shipping_tab_btn.config(
                 text=f"  SHIPPING ({len(self.session_units)})  ")
         self.after(200, self._start_index_build)
+
+    def get_next_lab_number(self, sheet_name, excel_next):
+        manual_next = self.next_lab_numbers.get(sheet_name)
+        if manual_next is None:
+            return excel_next
+        return manual_next
+
+    def set_next_lab_number(self, sheet_name, current_number):
+        self.next_lab_numbers[sheet_name] = int(current_number) + 1
 
     def _start_index_build(self):
         import threading
@@ -1480,6 +1552,7 @@ class RadarForm(tk.Frame):
         super().__init__(parent, bg=BG)
         self.app = app
         self._history = None
+        self._is_retest = False
         self._build()
 
     def _section(self, text):
@@ -1510,8 +1583,16 @@ class RadarForm(tk.Frame):
         r1.pack(fill='x', padx=16, pady=2)
         tk.Label(r1, text="Lab Number:", bg=PANEL_BG, fg=TEXT_DIM,
                  font=("Courier New", 9), width=16, anchor='w').pack(side='left')
-        tk.Label(r1, textvariable=self.lab_var, bg=PANEL_BG, fg=AMBER,
-                 font=("Courier New", 13, "bold")).pack(side='left')
+        self.lab_entry = tk.Entry(r1, textvariable=self.lab_var,
+                                  bg=ENTRY_BG, fg=AMBER,
+                                  insertbackground=TEXT,
+                                  font=("Courier New", 13, "bold"),
+                                  width=14, relief='solid', bd=1)
+        self.lab_entry.pack(side='left', ipady=3)
+        self.lab_entry.bind("<FocusOut>", self._sync_lab_number)
+        self.lab_entry.bind("<Return>", self._sync_lab_number)
+        tk.Label(r1, text=" editable", bg=PANEL_BG, fg=TEXT_DIM,
+                 font=("Courier New", 8)).pack(side='left', padx=6)
 
         r2 = tk.Frame(info_frame, bg=PANEL_BG)
         r2.pack(fill='x', padx=16, pady=2)
@@ -1599,7 +1680,7 @@ class RadarForm(tk.Frame):
         # FIX 1: Replaced Checkbutton with a custom toggle button so Enter/Space work reliably
         self.fork_toggle_btn = tk.Button(
             fork_check_frame,
-            text="[ ] Forks present  (press SPACE or ENTER to toggle)",
+            text="[ ] Tuning fork certificates present  (SPACE/ENTER)",
             bg=BG, fg=TEXT_DIM,
             font=("Courier New", 10), relief='flat',
             padx=0, pady=2, cursor='hand2',
@@ -1686,11 +1767,11 @@ class RadarForm(tk.Frame):
         self.fork_var.set(new_val)
         if new_val:
             self.fork_toggle_btn.config(
-                text="[✓] Forks present  (press SPACE or ENTER to toggle)",
+                text="[✓] Tuning fork certificates present  (SPACE/ENTER)",
                 fg=GREEN)
         else:
             self.fork_toggle_btn.config(
-                text="[ ] Forks present  (press SPACE or ENTER to toggle)",
+                text="[ ] Tuning fork certificates present  (SPACE/ENTER)",
                 fg=TEXT_DIM)
         self._toggle_forks()
 
@@ -1730,13 +1811,24 @@ class RadarForm(tk.Frame):
         try:
             wb = load_workbook(EXCEL_2026, read_only=True, data_only=True)
             ws = wb['RADAR']
-            n  = get_last_lab_number(ws, RADAR_PREFIX) + 1
+            excel_next  = get_last_lab_number(ws, RADAR_PREFIX) + 1
             wb.close()
         except Exception:
             ws = self.app.wb['RADAR']
-            n  = get_last_lab_number(ws, RADAR_PREFIX) + 1
+            excel_next  = get_last_lab_number(ws, RADAR_PREFIX) + 1
+        n = self.app.get_next_lab_number('RADAR', excel_next)
         self._lab_number = str(n)
-        self.lab_var.set(f"AS26-{n}")
+        self.lab_var.set(format_lab_number(RADAR_PREFIX, n))
+
+    def _sync_lab_number(self, event=None):
+        n = parse_lab_number(self.lab_var.get(), RADAR_PREFIX)
+        if n is None:
+            self.lab_entry.config(fg=RED)
+            return False
+        self._lab_number = str(n)
+        self.lab_var.set(format_lab_number(RADAR_PREFIX, n))
+        self.lab_entry.config(fg=AMBER)
+        return True
 
     def _on_type_change(self, event=None):
         global _last_radar_type
@@ -1752,27 +1844,28 @@ class RadarForm(tk.Frame):
     def _on_serial_verified(self, serial):
         history = self.app.show_history(serial, 'RADAR')
         self._history = history
+        self._is_retest = False
         if history:
             yrs = years_since(history['date'])
 
-            # FIX 2 & 3: Handle < 3 years case separately
-            if yrs is not None and yrs < 3.0:
+            if yrs is not None and yrs < RETEST_PROMPT_YEARS:
                 ans = messagebox.askyesno(
                     "⚠ Early Retest Warning",
                     f"This unit was last tested {yrs:.1f} years ago\n"
                     f"(Lab: {history['lab_number']}, Date: {history['date']})\n\n"
-                    f"Minimum interval is 3 years.\n\n"
+                    f"Minimum interval is {RETEST_MIN_YEARS:.0f} years.\n\n"
                     f"Is this a RETEST (proceed with auto-fill)?")
                 if ans:
-                    # FIX 3: It IS a retest — populate ALL fields including forks
-                    self._apply_retest_prefill(history)
+                    self._apply_retest_prefill(history, mark_retest=True)
                 else:
-                    # FIX 2: NOT a retest (or user declines) — do NOT populate any values
                     self._history = None
                     self.retest_lbl.config(text="")
                     return
+            elif yrs is not None and yrs < RETEST_MIN_YEARS:
+                self._history = None
+                self.retest_lbl.config(
+                    text=f"✓ Previous test {yrs:.1f} yrs ago — no retest prompt")
             else:
-                # >= 3 years: ask about retest + auto-fill as before
                 ans = messagebox.askyesno(
                     "Previous Entry Found",
                     f"Found previous entry:\n"
@@ -1782,17 +1875,19 @@ class RadarForm(tk.Frame):
                     f"  Address: {history['address_code']}\n\n"
                     f"Auto-fill fields from previous entry?")
                 if ans:
-                    # FIX 3: Populate ALL fields including forks/antennas
-                    self._apply_retest_prefill(history)
+                    self._apply_retest_prefill(history, mark_retest=False)
                 else:
-                    # User said no — leave fields empty
                     self.retest_lbl.config(text="")
         else:
             self.retest_lbl.config(text="")
 
-    def _apply_retest_prefill(self, history):
-        """FIX 3: Populate ALL available fields from history record."""
-        self.retest_lbl.config(text="◐ RETEST — fields pre-filled (verify to confirm)")
+    def _apply_retest_prefill(self, history, mark_retest=True):
+        """Populate all available fields from the history record."""
+        self._is_retest = mark_retest
+        if mark_retest:
+            self.retest_lbl.config(text="◐ RETEST — fields pre-filled (verify to confirm)")
+        else:
+            self.retest_lbl.config(text="◐ Previous entry — fields pre-filled (verify to confirm)")
         if history.get('chps_number'):
             self.chps_field.set_prefill(history['chps_number'])
         if history.get('address_code'):
@@ -1803,13 +1898,6 @@ class RadarForm(tk.Frame):
             self.ant1_field.set_prefill(history['antenna1_number'])
         if history.get('antenna2_number'):
             self.ant2_field.set_prefill(history['antenna2_number'])
-        # FIX 3: Fill fork values if available in history
-        # Fork values are stored in DEFAULT_FA/DEFAULT_FB by default;
-        # here we pre-fill with defaults so user can verify them
-        if not self.fork_var.get():
-            # Pre-fill FA/FB with defaults so they're ready if user enables forks
-            self.fa_field.set_prefill(DEFAULT_FA)
-            self.fb_field.set_prefill(DEFAULT_FB)
 
     def _addr_enter(self, event=None):
         self._lookup_address()
@@ -1844,6 +1932,10 @@ class RadarForm(tk.Frame):
         if self.fork_var.get():
             self.fork_fields_frame.pack(fill='x', pady=2,
                                         after=self.fork_toggle_btn.master)
+            if not self.fa_field.value and not self.fa_field.display_var.get().strip():
+                self.fa_field.set_prefill(DEFAULT_FA)
+            if not self.fb_field.value and not self.fb_field.display_var.get().strip():
+                self.fb_field.set_prefill(DEFAULT_FB)
             self._rewire_tab_order()
             # Move focus to FA field after toggle
             self.after(60, lambda: self.fa_field.entry_display.focus_set())
@@ -1855,6 +1947,8 @@ class RadarForm(tk.Frame):
         utype = self.unit_type_var.get()
         is_as = utype in ("AS", "ASP")
         errors = []
+        if not self._sync_lab_number():
+            errors.append("Lab Number is invalid")
         if not self.serial_field.is_locked:
             errors.append("Serial Number not verified")
         if not self.chps_field.is_locked:
@@ -1888,7 +1982,7 @@ class RadarForm(tk.Frame):
         serial = self.serial_field.value
         chps   = self.chps_field.value
         addr   = self.addr_var.get().strip()
-        is_retest = self._history is not None and self.retest_lbl.cget('text') != ""
+        is_retest = self._is_retest
 
         fa_number = self.fa_field.value if self.fork_var.get() else DEFAULT_FA
         fb_number = self.fb_field.value if self.fork_var.get() else DEFAULT_FB
@@ -1958,6 +2052,7 @@ class RadarForm(tk.Frame):
                 'serial': serial,
                 'chps': chps,
             })
+            self.app.set_next_lab_number('RADAR', int(self._lab_number))
             self.app.refresh_last_processed()
             self._clear()
 
@@ -1966,6 +2061,7 @@ class RadarForm(tk.Frame):
 
     def _clear(self):
         self._history = None
+        self._is_retest = False
         self._address_1 = None
         self._address_2 = None
         self.unit_type_var.set(_last_radar_type)
@@ -1980,7 +2076,7 @@ class RadarForm(tk.Frame):
         self.fork_var.set(False)
         # FIX 1: Reset the toggle button text on clear
         self.fork_toggle_btn.config(
-            text="[ ] Forks present  (press SPACE or ENTER to toggle)",
+            text="[ ] Tuning fork certificates present  (SPACE/ENTER)",
             fg=TEXT_DIM)
         self.fork_fields_frame.pack_forget()
         self.antenna_frame.pack(fill='x')
@@ -1998,6 +2094,7 @@ class LidarForm(tk.Frame):
         super().__init__(parent, bg=BG)
         self.app = app
         self._history = None
+        self._is_retest = False
         self._build()
 
     def _section(self, text):
@@ -2020,8 +2117,16 @@ class LidarForm(tk.Frame):
         r1.pack(fill='x', padx=16, pady=2)
         tk.Label(r1, text="Lab Number:", bg=PANEL_BG, fg=TEXT_DIM,
                  font=("Courier New", 9), width=16, anchor='w').pack(side='left')
-        tk.Label(r1, textvariable=self.lab_var, bg=PANEL_BG, fg=AMBER,
-                 font=("Courier New", 13, "bold")).pack(side='left')
+        self.lab_entry = tk.Entry(r1, textvariable=self.lab_var,
+                                  bg=ENTRY_BG, fg=AMBER,
+                                  insertbackground=TEXT,
+                                  font=("Courier New", 13, "bold"),
+                                  width=14, relief='solid', bd=1)
+        self.lab_entry.pack(side='left', ipady=3)
+        self.lab_entry.bind("<FocusOut>", self._sync_lab_number)
+        self.lab_entry.bind("<Return>", self._sync_lab_number)
+        tk.Label(r1, text=" editable", bg=PANEL_BG, fg=TEXT_DIM,
+                 font=("Courier New", 8)).pack(side='left', padx=6)
 
         r2 = tk.Frame(info_frame, bg=PANEL_BG)
         r2.pack(fill='x', padx=16, pady=2)
@@ -2129,13 +2234,24 @@ class LidarForm(tk.Frame):
         try:
             wb = load_workbook(EXCEL_2026, read_only=True, data_only=True)
             ws = wb['LIDAR']
-            n  = get_last_lab_number(ws, LIDAR_PREFIX) + 1
+            excel_next  = get_last_lab_number(ws, LIDAR_PREFIX) + 1
             wb.close()
         except Exception:
             ws = self.app.wb['LIDAR']
-            n  = get_last_lab_number(ws, LIDAR_PREFIX) + 1
+            excel_next  = get_last_lab_number(ws, LIDAR_PREFIX) + 1
+        n = self.app.get_next_lab_number('LIDAR', excel_next)
         self._lab_number = str(n)
-        self.lab_var.set(f"ASL26-{n}")
+        self.lab_var.set(format_lab_number(LIDAR_PREFIX, n))
+
+    def _sync_lab_number(self, event=None):
+        n = parse_lab_number(self.lab_var.get(), LIDAR_PREFIX)
+        if n is None:
+            self.lab_entry.config(fg=RED)
+            return False
+        self._lab_number = str(n)
+        self.lab_var.set(format_lab_number(LIDAR_PREFIX, n))
+        self.lab_entry.config(fg=AMBER)
+        return True
 
     def _on_lidar_type_change(self, event=None):
         global _last_lidar_type
@@ -2147,25 +2263,27 @@ class LidarForm(tk.Frame):
     def _on_serial_verified(self, serial):
         history = self.app.show_history(serial, 'LIDAR')
         self._history = history
+        self._is_retest = False
         if history:
             yrs = years_since(history['date'])
 
-            # FIX 2 & 3: Handle < 3 years case separately
-            if yrs is not None and yrs < 3.0:
+            if yrs is not None and yrs < RETEST_PROMPT_YEARS:
                 ans = messagebox.askyesno(
                     "⚠ Early Retest Warning",
                     f"This unit was last tested {yrs:.1f} years ago\n"
                     f"(Lab: {history['lab_number']}, Date: {history['date']})\n\n"
-                    f"Minimum interval is 3 years.\n\n"
+                    f"Minimum interval is {RETEST_MIN_YEARS:.0f} years.\n\n"
                     f"Is this a RETEST (proceed with auto-fill)?")
                 if ans:
-                    # FIX 3: Retest confirmed — populate all fields
-                    self._apply_retest_prefill(history)
+                    self._apply_retest_prefill(history, mark_retest=True)
                 else:
-                    # FIX 2: Not a retest — do NOT populate any values
                     self._history = None
                     self.retest_lbl.config(text="")
                     return
+            elif yrs is not None and yrs < RETEST_MIN_YEARS:
+                self._history = None
+                self.retest_lbl.config(
+                    text=f"✓ Previous test {yrs:.1f} yrs ago — no retest prompt")
             else:
                 ans = messagebox.askyesno(
                     "Previous Entry Found",
@@ -2176,16 +2294,19 @@ class LidarForm(tk.Frame):
                     f"  Address: {history['address_code']}\n\n"
                     f"Auto-fill fields from previous entry?")
                 if ans:
-                    # FIX 3: Populate all available fields
-                    self._apply_retest_prefill(history)
+                    self._apply_retest_prefill(history, mark_retest=False)
                 else:
                     self.retest_lbl.config(text="")
         else:
             self.retest_lbl.config(text="")
 
-    def _apply_retest_prefill(self, history):
-        """FIX 3: Populate ALL available fields from history record."""
-        self.retest_lbl.config(text="◐ RETEST — fields pre-filled (verify to confirm)")
+    def _apply_retest_prefill(self, history, mark_retest=True):
+        """Populate all available fields from the history record."""
+        self._is_retest = mark_retest
+        if mark_retest:
+            self.retest_lbl.config(text="◐ RETEST — fields pre-filled (verify to confirm)")
+        else:
+            self.retest_lbl.config(text="◐ Previous entry — fields pre-filled (verify to confirm)")
         if history.get('chps_number'):
             self.chps_field.set_prefill(history['chps_number'])
         if history.get('address_code'):
@@ -2218,6 +2339,8 @@ class LidarForm(tk.Frame):
 
     def _validate(self):
         errors = []
+        if not self._sync_lab_number():
+            errors.append("Lab Number is invalid")
         if not self.serial_field.is_locked:
             errors.append("Serial Number not verified")
         if not self.chps_field.is_locked:
@@ -2240,7 +2363,7 @@ class LidarForm(tk.Frame):
         serial = self.serial_field.value
         chps   = self.chps_field.value
         addr   = self.addr_var.get().strip()
-        is_retest = self._history is not None and self.retest_lbl.cget('text') != ""
+        is_retest = self._is_retest
 
         tpl_name = LIDAR_TEMPLATES[utype]
         files_needed = [
@@ -2292,6 +2415,7 @@ class LidarForm(tk.Frame):
                 'serial': serial,
                 'chps': chps,
             })
+            self.app.set_next_lab_number('LIDAR', int(self._lab_number))
             self.app.refresh_last_processed()
             self._clear()
 
@@ -2300,6 +2424,7 @@ class LidarForm(tk.Frame):
 
     def _clear(self):
         self._history = None
+        self._is_retest = False
         self._address_1 = None
         self._address_2 = None
         self.unit_type_var.set(_last_lidar_type)
@@ -3251,7 +3376,7 @@ class ShippingTab(tk.Frame):
                  bg=WHITE, fg=ACCENT,
                  font=("Courier New", 12, "bold")).pack(pady=(18, 2))
         tk.Label(dlg,
-                 text="Enter log numbers to add to the shipping list for sealing.\n"
+                 text="Enter log numbers or ranges to add to the shipping list for sealing.\n"
                       "Separate multiple entries with commas or new lines.",
                  bg=WHITE, fg=TEXT_DIM,
                  font=("Courier New", 9), justify='center').pack(pady=(0, 10))
@@ -3267,7 +3392,7 @@ class ShippingTab(tk.Frame):
         txt.pack(fill='x', ipady=4)
         txt.focus_set()
         tk.Label(txt_frame,
-                 text="e.g.  AS26-72\nASL26-45, ASL26-46",
+                 text="e.g.  AS26-72\nASL26-45, ASL26-46\nAS26-100 to AS26-108",
                  bg=WHITE, fg=TEXT_DIM,
                  font=("Courier New", 8), justify='left').pack(anchor='w', pady=(2,0))
 
@@ -3292,14 +3417,15 @@ class ShippingTab(tk.Frame):
             if not raw:
                 msg_lbl.config(text="⚠  Enter at least one log number.")
                 return
-            import re
-            entries = [x.strip() for x in re.split(r'[,\n]+', raw) if x.strip()]
+            entries, parse_errors = expand_log_number_entries(raw)
             if not entries:
                 msg_lbl.config(text="⚠  No valid log numbers found.")
+                if parse_errors:
+                    self._load_preview.config(text="\n".join(parse_errors), fg=RED)
                 return
 
             added = []
-            errors = []
+            errors = list(parse_errors)
             for log_num in entries:
                 result = _resolve_old_cert(log_num, self.app)
                 if result['ok']:
