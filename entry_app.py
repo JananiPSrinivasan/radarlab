@@ -453,6 +453,14 @@ def normalize_address_code(value):
         return digits[-3:] if len(digits) > 3 else digits
     return raw
 
+def detect_unit_type_prefix(value):
+    """Return a known RADAR/LIDAR unit type prefix from a scanned unit value."""
+    raw = str(value or '').strip().upper()
+    for unit_prefix in sorted(RADAR_TYPES + LIDAR_TYPES, key=len, reverse=True):
+        if raw.startswith(unit_prefix) and len(raw) > len(unit_prefix):
+            return unit_prefix
+    return None
+
 
 # ─────────────────────────────────────────────
 #  VERIFY DIALOG
@@ -1145,6 +1153,7 @@ class VerifiedField(tk.Frame):
         self._locked     = False
         self._value      = ""
         self._prefill    = prefill
+        self.last_raw_value = ""
 
         self._build()
         if prefill:
@@ -1199,6 +1208,7 @@ class VerifiedField(tk.Frame):
 
     def _normalize_current_value(self):
         current_val = self.display_var.get().strip()
+        self.last_raw_value = current_val
         normalized = normalize_scanned_value(
             current_val,
             field_label=self.label_text,
@@ -1211,6 +1221,7 @@ class VerifiedField(tk.Frame):
 
     def _set_prefill(self, value):
         self._prefill = value
+        self.last_raw_value = str(value or '')
         self.display_var.set(normalize_scanned_value(
             value,
             field_label=self.label_text,
@@ -1273,6 +1284,7 @@ class VerifiedField(tk.Frame):
         self._locked  = False
         self._value   = ""
         self._prefill = ""
+        self.last_raw_value = ""
         self.display_var.set("")
         self.border_frame.config(bg=RED)
         self.entry_display.config(
@@ -1928,6 +1940,15 @@ class RadarForm(tk.Frame):
         self._rewire_tab_order()
 
     def _on_serial_verified(self, serial):
+        detected_type = detect_unit_type_prefix(self.serial_field.last_raw_value)
+        if detected_type in RADAR_TYPES and detected_type != self.unit_type_var.get():
+            self.unit_type_var.set(detected_type)
+            self._on_type_change()
+        elif detected_type in LIDAR_TYPES:
+            messagebox.showwarning(
+                "LIDAR Scan Detected",
+                f"Scanned value looks like LIDAR type {detected_type}.\n"
+                f"Use the LIDAR tab for this unit.")
         history = self.app.show_history(serial, 'RADAR')
         self._history = history
         self._is_retest = False
@@ -1948,22 +1969,11 @@ class RadarForm(tk.Frame):
                     self.retest_lbl.config(text="")
                     return
             elif yrs is not None and yrs < RETEST_MIN_YEARS:
-                self._history = None
                 self.retest_lbl.config(
-                    text=f"✓ Previous test {yrs:.1f} yrs ago — no retest prompt")
+                    text=f"✓ Previous test {yrs:.1f} yrs ago — auto-filled")
+                self._apply_retest_prefill(history, mark_retest=False)
             else:
-                ans = messagebox.askyesno(
-                    "Previous Entry Found",
-                    f"Found previous entry:\n"
-                    f"  Lab: {history['lab_number']}\n"
-                    f"  Date: {history['date']}\n"
-                    f"  CHPS: {history['chps_number']}\n"
-                    f"  Address: {history['address_code']}\n\n"
-                    f"Auto-fill fields from previous entry?")
-                if ans:
-                    self._apply_retest_prefill(history, mark_retest=False)
-                else:
-                    self.retest_lbl.config(text="")
+                self._apply_retest_prefill(history, mark_retest=False)
         else:
             self.retest_lbl.config(text="")
 
@@ -1973,9 +1983,7 @@ class RadarForm(tk.Frame):
         if mark_retest:
             self.retest_lbl.config(text="◐ RETEST — fields pre-filled (verify to confirm)")
         else:
-            self.retest_lbl.config(text="◐ Previous entry — fields pre-filled (verify to confirm)")
-        if history.get('chps_number'):
-            self.chps_field.set_prefill(history['chps_number'])
+            self.retest_lbl.config(text="◐ Previous entry — fields auto-filled; enter current CHPS")
         if history.get('address_code'):
             self.addr_var.set(history['address_code'])
             self._lookup_address()
@@ -2353,6 +2361,15 @@ class LidarForm(tk.Frame):
             self.serial_field.any_length = (utype == 'LP')
 
     def _on_serial_verified(self, serial):
+        detected_type = detect_unit_type_prefix(self.serial_field.last_raw_value)
+        if detected_type in LIDAR_TYPES and detected_type != self.unit_type_var.get():
+            self.unit_type_var.set(detected_type)
+            self._on_lidar_type_change()
+        elif detected_type in RADAR_TYPES:
+            messagebox.showwarning(
+                "RADAR Scan Detected",
+                f"Scanned value looks like RADAR type {detected_type}.\n"
+                f"Use the RADAR tab for this unit.")
         history = self.app.show_history(serial, 'LIDAR')
         self._history = history
         self._is_retest = False
@@ -2373,22 +2390,11 @@ class LidarForm(tk.Frame):
                     self.retest_lbl.config(text="")
                     return
             elif yrs is not None and yrs < RETEST_MIN_YEARS:
-                self._history = None
                 self.retest_lbl.config(
-                    text=f"✓ Previous test {yrs:.1f} yrs ago — no retest prompt")
+                    text=f"✓ Previous test {yrs:.1f} yrs ago — auto-filled")
+                self._apply_retest_prefill(history, mark_retest=False)
             else:
-                ans = messagebox.askyesno(
-                    "Previous Entry Found",
-                    f"Found previous entry:\n"
-                    f"  Lab: {history['lab_number']}\n"
-                    f"  Date: {history['date']}\n"
-                    f"  CHPS: {history['chps_number']}\n"
-                    f"  Address: {history['address_code']}\n\n"
-                    f"Auto-fill fields from previous entry?")
-                if ans:
-                    self._apply_retest_prefill(history, mark_retest=False)
-                else:
-                    self.retest_lbl.config(text="")
+                self._apply_retest_prefill(history, mark_retest=False)
         else:
             self.retest_lbl.config(text="")
 
@@ -2398,9 +2404,7 @@ class LidarForm(tk.Frame):
         if mark_retest:
             self.retest_lbl.config(text="◐ RETEST — fields pre-filled (verify to confirm)")
         else:
-            self.retest_lbl.config(text="◐ Previous entry — fields pre-filled (verify to confirm)")
-        if history.get('chps_number'):
-            self.chps_field.set_prefill(history['chps_number'])
+            self.retest_lbl.config(text="◐ Previous entry — fields auto-filled; enter current CHPS")
         if history.get('address_code'):
             self.addr_var.set(history['address_code'])
             self._lookup_address()
