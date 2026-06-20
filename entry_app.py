@@ -516,6 +516,8 @@ def digits_match_transposed(a, b):
 
 def parse_lab_number(value, prefix):
     """Return the numeric lab number from a full lab value or bare number."""
+    import re
+
     raw = str(value or '').replace(' (RETEST)', '').strip()
     if not raw:
         return None
@@ -523,8 +525,9 @@ def parse_lab_number(value, prefix):
     upper_prefix = prefix.upper()
     if upper_raw.startswith(upper_prefix):
         raw = raw[len(prefix):].strip()
-    if raw.isdigit():
-        return int(raw)
+    match = re.search(r'\d+', raw)
+    if match:
+        return int(match.group(0))
     return None
 
 def format_lab_number(prefix, number):
@@ -663,10 +666,17 @@ def is_blank_excel_value(value):
 def is_current_year_record(history):
     if not history:
         return False
-    current_file = os.path.basename(EXCEL_2026)
+    import ntpath
+
+    current_file = ntpath.basename(EXCEL_2026)
+    source_path = str(history.get('source_path') or '')
+    source_file = str(history.get('source_file') or '')
     return (
-        history.get('source_path') == EXCEL_2026 or
-        history.get('source_file') == current_file
+        source_path == EXCEL_2026 or
+        os.path.basename(source_path) == current_file or
+        ntpath.basename(source_path) == current_file or
+        source_file == current_file or
+        ntpath.basename(source_file) == current_file
     )
 
 def is_current_year_failed_record(history):
@@ -2182,7 +2192,7 @@ class RadarForm(tk.Frame):
         return True
 
     def _reuse_current_year_failed_lab(self, history):
-        if not is_current_year_failed_record(history):
+        if not is_current_year_record(history):
             return False
         n = parse_lab_number(history.get('lab_number'), RADAR_PREFIX)
         if n is None:
@@ -2645,7 +2655,7 @@ class LidarForm(tk.Frame):
         return True
 
     def _reuse_current_year_failed_lab(self, history):
-        if not is_current_year_failed_record(history):
+        if not is_current_year_record(history):
             return False
         n = parse_lab_number(history.get('lab_number'), LIDAR_PREFIX)
         if n is None:
