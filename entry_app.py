@@ -212,6 +212,8 @@ def _db_row_to_record(row):
         'antenna2_number': row['antenna2_number'],
         'source_file':     row['source_file'],
         'source_path':     row['source_path'],
+        'file_order':      row['file_order'],
+        'row_order':       row['row_order'],
     }
 
 def _insert_history_record(conn, record):
@@ -282,7 +284,7 @@ def _search_history_db(serial_number, sheet_name, all_matches=False):
         """, (sheet_name, f"%{serial_number}")).fetchall()
         conn.close()
         records = [_db_row_to_record(row) for row in rows]
-        return records if all_matches else (records[0] if records else None)
+        return records if all_matches else choose_best_history_record(records)
     except Exception:
         return [] if all_matches else None
 
@@ -368,10 +370,11 @@ def search_all_history(serial_number, sheet_name):
     """
     if _INDEX_READY:
         sheet_index = _HISTORY_INDEX.get(sheet_name, {})
-        for key, record in sheet_index.items():
-            if key.endswith(serial_number):
-                return record
-        return None
+        matches = [
+            record for key, record in sheet_index.items()
+            if key.endswith(serial_number)
+        ]
+        return choose_best_history_record(matches)
 
     cached_record = _search_history_db(serial_number, sheet_name, all_matches=False)
     if cached_record:
@@ -661,6 +664,31 @@ def is_current_year_record(history):
 
 def is_current_year_failed_record(history):
     return is_current_year_record(history) and is_blank_excel_value(history.get('shipped_date'))
+
+def choose_best_history_record(records):
+    """Prefer same-year failed/current-year records over older matching serials."""
+    if not records:
+        return None
+
+    def score(record):
+        file_order = record.get('file_order')
+        row_order = record.get('row_order')
+        try:
+            file_order = int(file_order)
+        except (TypeError, ValueError):
+            file_order = -1
+        try:
+            row_order = int(row_order)
+        except (TypeError, ValueError):
+            row_order = -1
+        return (
+            1 if is_current_year_failed_record(record) else 0,
+            1 if is_current_year_record(record) else 0,
+            file_order,
+            row_order,
+        )
+
+    return max(records, key=score)
 
 
 # ─────────────────────────────────────────────
