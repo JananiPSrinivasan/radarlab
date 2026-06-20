@@ -193,7 +193,7 @@ def _clean_history_row(row_tuple, sheet_name, source_file, source_path, file_ord
         'lab_number':      row_tuple[0],
         'unit_serial':     str(cell_b).strip(),
         'chps_number':     chps_clean,
-        'address_code':    row_tuple[3],
+        'address_code':    normalize_address_code(row_tuple[3]),
         'date':            row_tuple[4],
         'shipped_date':    ship_val,
         'antenna1_number': ant1_clean,
@@ -205,12 +205,13 @@ def _db_row_to_record(row):
         'lab_number':      row['lab_number'],
         'unit_serial':     row['unit_serial'],
         'chps_number':     row['chps_number'] or '',
-        'address_code':    row['address_code'],
+        'address_code':    normalize_address_code(row['address_code']),
         'date':            row['cert_date'],
         'shipped_date':    row['shipped_date'],
         'antenna1_number': row['antenna1_number'],
         'antenna2_number': row['antenna2_number'],
         'source_file':     row['source_file'],
+        'source_path':     row['source_path'],
     }
 
 def _insert_history_record(conn, record):
@@ -284,6 +285,13 @@ def _search_history_db(serial_number, sheet_name, all_matches=False):
         return records if all_matches else (records[0] if records else None)
     except Exception:
         return [] if all_matches else None
+
+def update_history_index_record(sheet_name, record):
+    """Keep the runtime history index current after saving a new Excel row."""
+    try:
+        _HISTORY_INDEX.setdefault(sheet_name, {})[record['unit_serial']] = record
+    except Exception:
+        pass
 
 def _build_history_index(on_progress=None):
     """
@@ -370,7 +378,7 @@ def search_all_history(serial_number, sheet_name):
         return cached_record
 
     # Fallback: original file scan
-    all_files = _history_workbooks()
+    all_files = [EXCEL_2026] + sorted(glob.glob(os.path.join(HISTORY_DIR, 'week_report_*.xlsx')), reverse=True)
 
     for filepath in all_files:
         try:
@@ -397,12 +405,13 @@ def search_all_history(serial_number, sheet_name):
                         'lab_number':   lab_val,
                         'unit_serial':  cell,
                         'chps_number':  chps_clean,
-                        'address_code': addr_val,
+                        'address_code': normalize_address_code(addr_val),
                         'date':         date_val,
                         'shipped_date': ship_val,
                         'antenna1_number': ant1_clean,
                         'antenna2_number': ant2_clean,
                         'source_file':  os.path.basename(filepath),
+                        'source_path':  filepath,
                     }
             wb.close()
         except Exception:
@@ -452,12 +461,13 @@ def search_all_entries_for_serial(serial_number, sheet_name):
                         'lab_number':      row_tuple[0],
                         'unit_serial':     key,
                         'chps_number':     chps_clean,
-                        'address_code':    row_tuple[3],
+                        'address_code':    normalize_address_code(row_tuple[3]),
                         'date':            row_tuple[4],
                         'shipped_date':    ship_val,
                         'antenna1_number': ant1_clean,
                         'antenna2_number': ant2_clean,
                         'source_file':     fname,
+                        'source_path':     filepath,
                     })
             wb.close()
         except Exception:
@@ -608,12 +618,20 @@ def normalize_address_code(value):
     """Accept scans like 'CHP (530)' or 'Address: 530' and return the code."""
     import re
 
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, int):
+        return str(value)
+
     raw = str(value or '').strip()
     if not raw:
         return ''
     m = re.search(r'CHP\s*\(([^)]+)\)', raw, flags=re.IGNORECASE)
     if m:
         return m.group(1).strip()
+    decimal_m = re.fullmatch(r'(\d+)\.0+', raw)
+    if decimal_m:
+        return decimal_m.group(1)
     digits = ''.join(re.findall(r'\d+', raw))
     if digits:
         return digits[-3:] if len(digits) > 3 else digits
@@ -626,6 +644,23 @@ def detect_unit_type_prefix(value):
         if raw.startswith(unit_prefix) and len(raw) > len(unit_prefix):
             return unit_prefix
     return None
+
+def is_blank_excel_value(value):
+    if value is None:
+        return True
+    return str(value).strip() in ('', ' ', 'None', '—')
+
+def is_current_year_record(history):
+    if not history:
+        return False
+    current_file = os.path.basename(EXCEL_2026)
+    return (
+        history.get('source_path') == EXCEL_2026 or
+        history.get('source_file') == current_file
+    )
+
+def is_current_year_failed_record(history):
+    return is_current_year_record(history) and is_blank_excel_value(history.get('shipped_date'))
 
 
 # ─────────────────────────────────────────────
@@ -1717,6 +1752,7 @@ class EntryApp(tk.Tk):
 
         self._current_tab = 'RADAR'
         self.radar_form.pack(fill='x', padx=10, pady=10)
+        self.after(100, self.radar_form.focus_unit_field)
 
     def _switch_tab(self, tab):
         if self._current_tab == tab:
@@ -1739,10 +1775,12 @@ class EntryApp(tk.Tk):
             self.radar_form.pack(fill='x', padx=10, pady=10)
             self.radar_tab_btn.config(bg=ACCENT, fg=WHITE)
             self.radar_form._compute_lab_number()
+            self.after(100, self.radar_form.focus_unit_field)
         elif tab == 'LIDAR':
             self.lidar_form.pack(fill='x', padx=10, pady=10)
             self.lidar_tab_btn.config(bg=ACCENT, fg=WHITE)
             self.lidar_form._compute_lab_number()
+            self.after(100, self.lidar_form.focus_unit_field)
         elif tab == 'SHIPPING':
             self.shipping_form.refresh()
             self.shipping_form.pack(fill='both', expand=True, padx=10, pady=10)
@@ -1815,6 +1853,7 @@ class RadarForm(tk.Frame):
         self.app = app
         self._history = None
         self._is_retest = False
+        self._reused_current_year_lab = False
         self._build()
 
     def _section(self, text):
@@ -2024,6 +2063,9 @@ class RadarForm(tk.Frame):
         self._after_addr_target = self.ant1_field
         self.after(10, self._wire_tab_order)
 
+    def focus_unit_field(self):
+        self.after(50, lambda: self.serial_field.entry_display.focus_set())
+
     # FIX 1: New toggle method for the button-style fork control
     def _toggle_forks_btn(self):
         """Toggle the fork_var and update button label; called by Enter/Space/Click."""
@@ -2094,6 +2136,17 @@ class RadarForm(tk.Frame):
         self.lab_entry.config(fg=AMBER)
         return True
 
+    def _reuse_current_year_failed_lab(self, history):
+        if not is_current_year_failed_record(history):
+            return False
+        n = parse_lab_number(history.get('lab_number'), RADAR_PREFIX)
+        if n is None:
+            return False
+        self._lab_number = str(n)
+        self.lab_var.set(format_lab_number(RADAR_PREFIX, n))
+        self._reused_current_year_lab = True
+        return True
+
     def _on_type_change(self, event=None):
         global _last_radar_type
         utype = self.unit_type_var.get()
@@ -2118,7 +2171,13 @@ class RadarForm(tk.Frame):
         history = self.app.show_history(serial, 'RADAR')
         self._history = history
         self._is_retest = False
+        self._reused_current_year_lab = False
         if history:
+            if self._reuse_current_year_failed_lab(history):
+                self._apply_retest_prefill(history, mark_retest=True)
+                self.retest_lbl.config(
+                    text="◐ RETEST — same-year failed unit; fields pre-filled")
+                return
             yrs = years_since(history['date'])
 
             if yrs is not None and yrs < RETEST_PROMPT_YEARS:
@@ -2150,6 +2209,8 @@ class RadarForm(tk.Frame):
             self.retest_lbl.config(text="◐ RETEST — fields pre-filled (verify to confirm)")
         else:
             self.retest_lbl.config(text="◐ Previous entry — fields auto-filled; enter current CHPS")
+        if mark_retest and history.get('chps_number'):
+            self.chps_field.set_prefill(history['chps_number'])
         if history.get('address_code'):
             self.addr_var.set(history['address_code'])
             self._lookup_address()
@@ -2299,6 +2360,18 @@ class RadarForm(tk.Frame):
                            " ", " ", "N/A", "N/A"])
 
             self.app.wb.save(EXCEL_2026)
+            update_history_index_record('RADAR', {
+                'lab_number':      lab_display,
+                'unit_serial':     utype_prefix + serial,
+                'chps_number':     chps,
+                'address_code':    normalize_address_code(addr),
+                'date':            self.app.current_date,
+                'shipped_date':    " ",
+                'antenna1_number': ant1 if not is_as else None,
+                'antenna2_number': ant2 if not is_as else None,
+                'source_file':     os.path.basename(EXCEL_2026),
+                'source_path':     EXCEL_2026,
+            })
 
             self.status_lbl.config(
                 text=f"✓ Certificate saved: AS26-{self._lab_number}",
@@ -2316,7 +2389,8 @@ class RadarForm(tk.Frame):
                 'serial': serial,
                 'chps': chps,
             })
-            self.app.set_next_lab_number('RADAR', int(self._lab_number))
+            if not self._reused_current_year_lab:
+                self.app.set_next_lab_number('RADAR', int(self._lab_number))
             self.app.refresh_last_processed()
             self._clear()
 
@@ -2326,6 +2400,7 @@ class RadarForm(tk.Frame):
     def _clear(self):
         self._history = None
         self._is_retest = False
+        self._reused_current_year_lab = False
         self._address_1 = None
         self._address_2 = None
         self.unit_type_var.set(_last_radar_type)
@@ -2348,6 +2423,7 @@ class RadarForm(tk.Frame):
         self.status_lbl.config(text="")
         self._compute_lab_number()
         self.app.history_panel.clear()
+        self.focus_unit_field()
 
 
 # ─────────────────────────────────────────────
@@ -2359,6 +2435,7 @@ class LidarForm(tk.Frame):
         self.app = app
         self._history = None
         self._is_retest = False
+        self._reused_current_year_lab = False
         self._build()
 
     def _section(self, text):
@@ -2491,6 +2568,9 @@ class LidarForm(tk.Frame):
 
         self.after(10, self._wire_tab_order)
 
+    def focus_unit_field(self):
+        self.after(50, lambda: self.serial_field.entry_display.focus_set())
+
     def _wire_tab_order(self):
         self.serial_field.next_field = self.chps_field
         self.chps_field.next_field   = self.addr_entry
@@ -2519,6 +2599,17 @@ class LidarForm(tk.Frame):
         self.lab_entry.config(fg=AMBER)
         return True
 
+    def _reuse_current_year_failed_lab(self, history):
+        if not is_current_year_failed_record(history):
+            return False
+        n = parse_lab_number(history.get('lab_number'), LIDAR_PREFIX)
+        if n is None:
+            return False
+        self._lab_number = str(n)
+        self.lab_var.set(format_lab_number(LIDAR_PREFIX, n))
+        self._reused_current_year_lab = True
+        return True
+
     def _on_lidar_type_change(self, event=None):
         global _last_lidar_type
         utype = self.unit_type_var.get()
@@ -2539,7 +2630,13 @@ class LidarForm(tk.Frame):
         history = self.app.show_history(serial, 'LIDAR')
         self._history = history
         self._is_retest = False
+        self._reused_current_year_lab = False
         if history:
+            if self._reuse_current_year_failed_lab(history):
+                self._apply_retest_prefill(history, mark_retest=True)
+                self.retest_lbl.config(
+                    text="◐ RETEST — same-year failed unit; fields pre-filled")
+                return
             yrs = years_since(history['date'])
 
             if yrs is not None and yrs < RETEST_PROMPT_YEARS:
@@ -2571,6 +2668,8 @@ class LidarForm(tk.Frame):
             self.retest_lbl.config(text="◐ RETEST — fields pre-filled (verify to confirm)")
         else:
             self.retest_lbl.config(text="◐ Previous entry — fields auto-filled; enter current CHPS")
+        if mark_retest and history.get('chps_number'):
+            self.chps_field.set_prefill(history['chps_number'])
         if history.get('address_code'):
             self.addr_var.set(history['address_code'])
             self._lookup_address()
@@ -2665,6 +2764,18 @@ class LidarForm(tk.Frame):
             ws.append([lab_display, utype+serial, 'CHPS'+chps, addr,
                        self.app.current_date, " ", " ", " ", unit_name])
             self.app.wb.save(EXCEL_2026)
+            update_history_index_record('LIDAR', {
+                'lab_number':      lab_display,
+                'unit_serial':     utype + serial,
+                'chps_number':     chps,
+                'address_code':    normalize_address_code(addr),
+                'date':            self.app.current_date,
+                'shipped_date':    " ",
+                'antenna1_number': None,
+                'antenna2_number': None,
+                'source_file':     os.path.basename(EXCEL_2026),
+                'source_path':     EXCEL_2026,
+            })
 
             self.status_lbl.config(
                 text=f"✓ Certificate saved: ASL26-{self._lab_number}", fg=GREEN)
@@ -2681,7 +2792,8 @@ class LidarForm(tk.Frame):
                 'serial': serial,
                 'chps': chps,
             })
-            self.app.set_next_lab_number('LIDAR', int(self._lab_number))
+            if not self._reused_current_year_lab:
+                self.app.set_next_lab_number('LIDAR', int(self._lab_number))
             self.app.refresh_last_processed()
             self._clear()
 
@@ -2691,6 +2803,7 @@ class LidarForm(tk.Frame):
     def _clear(self):
         self._history = None
         self._is_retest = False
+        self._reused_current_year_lab = False
         self._address_1 = None
         self._address_2 = None
         self.unit_type_var.set(_last_lidar_type)
@@ -2702,6 +2815,7 @@ class LidarForm(tk.Frame):
         self.status_lbl.config(text="")
         self._compute_lab_number()
         self.app.history_panel.clear()
+        self.focus_unit_field()
 
 
 # ─────────────────────────────────────────────
