@@ -277,11 +277,18 @@ def _search_history_db(serial_number, sheet_name, all_matches=False):
     try:
         conn = _history_db_connect()
         conn.row_factory = sqlite3.Row
-        rows = conn.execute("""
-            SELECT * FROM records
-            WHERE sheet_name = ? AND unit_serial LIKE ?
-            ORDER BY file_order DESC, row_order DESC
-        """, (sheet_name, f"%{serial_number}")).fetchall()
+        rows = []
+        seen_ids = set()
+        for term in serial_search_terms(serial_number):
+            for row in conn.execute("""
+                SELECT * FROM records
+                WHERE sheet_name = ? AND unit_serial LIKE ?
+                ORDER BY file_order DESC, row_order DESC
+            """, (sheet_name, f"%{term}")).fetchall():
+                row_id = row['id']
+                if row_id not in seen_ids:
+                    seen_ids.add(row_id)
+                    rows.append(row)
         conn.close()
         records = [_db_row_to_record(row) for row in rows]
         return records if all_matches else choose_best_history_record(records)
@@ -372,7 +379,7 @@ def search_all_history(serial_number, sheet_name):
         sheet_index = _HISTORY_INDEX.get(sheet_name, {})
         matches = [
             record for key, record in sheet_index.items()
-            if key.endswith(serial_number)
+            if any(str(key).endswith(term) for term in serial_search_terms(serial_number))
         ]
         return choose_best_history_record(matches)
 
@@ -392,7 +399,7 @@ def search_all_history(serial_number, sheet_name):
             ws = wb[sheet_name]
             for row in range(ws.max_row, 1, -1):
                 cell = ws.cell(row=row, column=2).value
-                if cell and str(cell).endswith(serial_number):
+                if cell and any(str(cell).endswith(term) for term in serial_search_terms(serial_number)):
                     date_val  = ws.cell(row=row, column=5).value
                     lab_val   = ws.cell(row=row, column=1).value
                     chps_val  = ws.cell(row=row, column=3).value
@@ -452,7 +459,7 @@ def search_all_entries_for_serial(serial_number, sheet_name):
                 if not cell_b:
                     continue
                 key = str(cell_b).strip()
-                if key.endswith(serial_number):
+                if any(key.endswith(term) for term in serial_search_terms(serial_number)):
                     chps_val = row_tuple[2]
                     ant1_val = row_tuple[11] if sheet_name == 'RADAR' and len(row_tuple) > 11 else None
                     ant2_val = row_tuple[12] if sheet_name == 'RADAR' and len(row_tuple) > 12 else None
@@ -664,6 +671,16 @@ def is_current_year_record(history):
 
 def is_current_year_failed_record(history):
     return is_current_year_record(history) and is_blank_excel_value(history.get('shipped_date'))
+
+def serial_search_terms(serial_number):
+    raw = str(serial_number or '').strip()
+    terms = []
+    if raw:
+        terms.append(raw)
+        stripped = raw.lstrip('0')
+        if stripped and stripped != raw:
+            terms.append(stripped)
+    return terms
 
 def choose_best_history_record(records):
     """Prefer same-year failed/current-year records over older matching serials."""
